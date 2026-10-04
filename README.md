@@ -1,4 +1,4 @@
-# tvheadend
+# ATSC TV decode/streamer!
 
 Free over-the-air TV (US ATSC 1.0) received with an **Airspy R2** software
 defined radio, decoded entirely in software, and served to every device on the
