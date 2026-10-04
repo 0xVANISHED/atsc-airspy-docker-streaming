@@ -1,0 +1,11 @@
+# Tvheadend runtime state: settings, channels, EPG, user accounts and passwords
+/config/
+# DVR output
+/recordings/
+# Receiver config, scan results and CPU-specific VOLK profile (./atsc.sh, bootstrap.sh)
+/atsc/config/
+
+# IQ captures, transport streams, scratch
+*.iq
+*.ts
+__pycache__/

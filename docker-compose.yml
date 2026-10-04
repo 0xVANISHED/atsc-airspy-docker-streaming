@@ -1,0 +1,83 @@
+# Over-the-air ATSC TV from an Airspy R2, served by Tvheadend.
+#
+#   atsc-rx    Airspy R2 -> GNU Radio gr-dtv -> MPEG-TS over UDP (127.0.0.1:5500+RF)
+#   atsc-scan  one-off channel scan (tools profile; ./atsc.sh scan runs it)
+#   tvheadend  ingests that UDP stream as an IPTV mux and serves it to clients
+#
+# Tvheadend can't drive an SDR itself, so the Airspy is only passed to atsc-rx.
+# State lives next to this file (all git-ignored):
+#   ./atsc/config -> /config                         (atsc-rx.conf, channels.json, VOLK profile)
+#   ./config      -> /var/lib/tvheadend             (settings, channels, EPG)
+#   ./recordings  -> /var/lib/tvheadend/recordings  (DVR)
+#
+# Web UI: http://<host>:9981   HTSP (Kodi etc.): 9982
+#
+# All containers run as UID/GID 1000 (the first user on Debian/Ubuntu) so files
+# they write stay owned by that user, and take the host's timezone from
+# /etc/localtime.
+
+# Shared by atsc-rx and atsc-scan: same image, Airspy access and config dir.
+x-airspy: &airspy
+  build: ./atsc
+  image: atsc-rx:local
+  # Host networking so the UDP stream reaches Tvheadend on localhost.
+  network_mode: host
+  user: "1000:1000"
+  group_add:
+    - plugdev   # owns the Airspy's /dev/bus/usb node (udev/60-airspy.rules); GID 46 on host and image
+  # Bind-mount the USB bus (instead of a fixed device node) and allow USB char
+  # devices, so an unplug/replug of the Airspy is picked up on restart.
+  device_cgroup_rules:
+    - "c 189:* rmw"
+  volumes:
+    - /dev/bus/usb:/dev/bus/usb
+    - /etc/localtime:/etc/localtime:ro
+    - ./atsc/config:/config
+
+services:
+  atsc-rx:
+    <<: *airspy
+    container_name: atsc-rx
+    restart: unless-stopped
+    # Channel and gain come from ./atsc/config/atsc-rx.conf (./atsc.sh tune);
+    # RF_CHANNEL / GAIN environment variables override it.
+
+  atsc-scan:
+    <<: *airspy
+    profiles: [tools]
+    entrypoint: ["python3", "/app/atsc_scan.py"]
+
+  tvheadend:
+    image: ghcr.io/tvheadend/tvheadend:master-debian
+    container_name: tvheadend
+    restart: unless-stopped
+    # Host networking: receives the decoder's UDP stream on localhost and
+    # serves clients on the LAN without port mapping.
+    network_mode: host
+    user: "1000:1000"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./config:/var/lib/tvheadend:rw
+      - ./recordings:/var/lib/tvheadend/recordings:rw
+    command: --config /var/lib/tvheadend --nosatip
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nproc: 256
+      nofile:
+        soft: 8192
+        hard: 65535
+    # Hardware transcoding (later): needs an image with intel-media-va-driver
+    # added (upstream image only ships mesa VA drivers, which don't cover Intel).
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "<video gid>"
+    #   - "<render gid>"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if b'PONG' in urllib.request.urlopen('http://127.0.0.1:9981/ping', timeout=5).read() else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

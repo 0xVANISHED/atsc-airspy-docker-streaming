@@ -1,0 +1,2 @@
+# Airspy R2: let plugdev (and the logged-in user) open the device. Installed by host-setup.sh.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1", SYMLINK+="airspy-%k", GROUP="plugdev", TAG+="uaccess"

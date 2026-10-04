@@ -1,0 +1,20 @@
+[Unit]
+Description=Tvheadend Stack
+After=network-online.target
+Wants=network-online.target
+Conflicts=shutdown.target
+StartLimitIntervalSec=180
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+EnvironmentFile=-/etc/environment
+WorkingDirectory=%h/tvheadend
+ExecStartPre=/usr/bin/docker info
+ExecStart=/usr/bin/docker compose up --remove-orphans --no-color
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=default.target
