@@ -1,6 +1,7 @@
 # Over-the-air ATSC TV from an Airspy R2, served by Tvheadend.
 #
-#   atsc-rx    Airspy R2 -> GNU Radio gr-dtv -> MPEG-TS over UDP (127.0.0.1:5500+RF)
+#   atsc-rx    on-demand tuner: GET http://127.0.0.1:5600/rf/<n> tunes the Airspy and
+#              streams that RF channel's MPEG-TS (GNU Radio gr-dtv); idle when unwatched
 #   atsc-scan  one-off channel scan (tools profile; ./atsc.sh scan runs it)
 #   tvheadend  ingests that UDP stream as an IPTV mux and serves it to clients
 #
@@ -20,7 +21,7 @@
 x-airspy: &airspy
   build: ./atsc
   image: atsc-rx:local
-  # Host networking so the UDP stream reaches Tvheadend on localhost.
+  # Host networking: Tvheadend reaches the tuner on 127.0.0.1:5600.
   network_mode: host
   user: "1000:1000"
   group_add:
@@ -39,8 +40,14 @@ services:
     <<: *airspy
     container_name: atsc-rx
     restart: unless-stopped
-    # Channel and gain come from ./atsc/config/atsc-rx.conf (./atsc.sh tune);
-    # RF_CHANNEL / GAIN environment variables override it.
+    # Tvheadend picks the RF channel per request; GAIN / LISTEN / IDLE_STOP come
+    # from ./atsc/config/atsc-rx.conf, environment variables override.
+    command: ["--serve"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5600/status', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
 
   atsc-scan:
     <<: *airspy

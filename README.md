@@ -4,12 +4,12 @@ Free over-the-air TV (US ATSC 1.0) received with an **Airspy R2** software
 defined radio, decoded entirely in software, and served to every device on the
 local network by [Tvheadend](https://tvheadend.org): as an M3U playlist with a
 programme guide for VLC, Stremio, Jellyfin and other players, or over HTSP
-for Kodi.
+for Kodi. Switch channels in your player; the radio retunes on demand.
 
 ```
-antenna ─► Airspy R2 ─► atsc-rx ──── MPEG-TS / UDP ───► Tvheadend ─► players on the LAN
-            (USB)       GNU Radio    127.0.0.1:5500+RF    :9981 HTTP (M3U, XMLTV, streams)
-                        gr-dtv                            :9982 HTSP (Kodi)
+antenna ─► Airspy R2 ─► atsc-rx (on-demand tuner) ◄── HTTP /rf/<n> ── Tvheadend ─► players on the LAN
+            (USB)       GNU Radio gr-dtv           ── MPEG-TS ──────►  :9981 HTTP (M3U, XMLTV, streams)
+                        127.0.0.1:5600                                 :9982 HTSP (Kodi)
 ```
 
 Everything runs in Docker, started by a systemd user unit, and the whole setup
@@ -21,7 +21,8 @@ is reproducible from this repo with two scripts.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Watching on the local network](#watching-on-the-local-network): VLC, Stremio, Kodi, Jellyfin
-- [Choosing the TV channel](#choosing-the-tv-channel): scan, tune, configuration
+- [Channels and reception](#channels-and-reception): scan, sync, antenna
+- [Configuration](#configuration)
 - [Operations](#operations): status, logs, updates, uninstall
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
@@ -31,28 +32,36 @@ is reproducible from this repo with two scripts.
 
 A broadcast **RF channel** (6 MHz wide, e.g. RF 26 at 545 MHz) carries one
 MPEG transport stream of about 19.4 Mbps holding several **virtual channels**
-(8.1 KGW, 8.2 Quest, ...). The receiver demodulates one RF channel at a time
-and hands the whole transport stream to Tvheadend, which splits it into
-channels, reads the broadcasters' guide data (PSIP), and serves them.
+(8.1 KGW, 8.2 Quest, ...). The Airspy can receive one RF channel at a time.
 
 | Container | Role |
 |---|---|
-| `atsc-rx` | GNU Radio ATSC 1.0 (8VSB) receiver. Reads the Airspy over USB, writes the transport stream to `udp://127.0.0.1:<5500 + RF channel>`. |
-| `tvheadend` | Ingests that stream as an IPTV mux with ATSC/PSIP parsing; serves the web UI, playlists, guide and streams. |
-| `atsc-scan` | One-off channel scanner (same image, compose `tools` profile), run by `./atsc.sh scan`. |
+| `atsc-rx` | **On-demand tuner.** `GET http://127.0.0.1:5600/rf/<n>` tunes the Airspy to RF channel *n*, runs the GNU Radio ATSC decoder and streams that RF channel's transport stream. A request for another RF channel retunes; with nobody watching for 10 s it stops decoding (the CPU idles). `GET /status` reports what it's doing. |
+| `tvheadend` | One IPTV mux per receivable RF channel, each pointing at the tuner. Reads the broadcasters' channel list and guide (PSIP), and serves the web UI, playlist, guide and streams. |
+| `atsc-scan` | Channel scanner (same image, compose `tools` profile), run by `./atsc.sh scan`. |
+
+So **every channel that can be received is always in the playlist**. Picking
+one makes Tvheadend open that RF channel's mux, the tuner retunes (1-2 s), and
+the picture starts. Tvheadend allows only one input stream on the network (one
+Airspy), so:
+
+- Any number of viewers can watch channels **on the same RF channel** at the
+  same time (e.g. 8.1 and 8.2).
+- While someone watches, a request for a channel on a **different** RF channel
+  is refused (Tvheadend reports no free tuner) until they stop.
+- Background jobs (guide grabbing, scans) have lower priority and wait for the
+  tuner rather than interrupting anyone.
 
 Limits:
 
-- **One RF channel at a time** (one Airspy, one decoder). All virtual channels
-  on that RF channel are available simultaneously. `./atsc.sh tune` switches.
 - **ATSC 1.0 only.** ATSC 3.0 (NextGen TV) stations show up in a scan as
   "signal without 8VSB pilot" and can't be decoded.
 - **Multipath-sensitive.** GNU Radio's equalizer is much simpler than a TV's
   tuner chip; channels with strong reflections (high "ripple" in a scan)
   won't lock. Antenna placement matters more than with a TV.
-- **CPU-bound.** Real-time decoding needs roughly 2 cores of a 2017-era laptop
-  CPU (see [Receiver internals](#receiver-internals)). Don't add software
-  transcoding on the same machine.
+- **CPU-bound while watching.** Real-time decoding needs roughly 2 cores of a
+  2017-era laptop CPU (see [Receiver internals](#receiver-internals)). Don't
+  add software transcoding on the same machine.
 
 ## Requirements
 
@@ -79,19 +88,20 @@ GPU (`/dev/dri`) is available for future hardware transcoding.
 
 `bootstrap.sh` (idempotent):
 
-1. Creates `config/`, `recordings/`, `atsc/config/`.
+1. Creates `config/`, `recordings/`, `atsc/config/` (with a default
+   `atsc-rx.conf`).
 2. If there's no Tvheadend config yet, seeds an `admin` account with a random
    password and **prints it once** (stored obfuscated in `config/superuser`).
 3. Pulls Tvheadend, builds the `atsc-rx` image, and profiles the CPU's SIMD
    kernels (VOLK) into `atsc/config/volk/`.
 4. Installs and starts `~/.config/systemd/user/tvheadend.service`.
-5. Registers the configured RF channel in Tvheadend, or on a fresh machine
-   scans and tunes the strongest clean station.
+5. Scans for channels on a fresh machine (about 2 minutes), otherwise syncs
+   Tvheadend with the last scan.
 6. Prints the player URLs (see below).
 
 Web UI: `http://<host>:9981`. The first time, Tvheadend's setup wizard may
-open; you can skip the tuner/network steps (the receiver is already
-configured) and use it to set your own admin password.
+open; you can skip the tuner/network steps (they're already configured) and use
+it to set your own admin password.
 
 ## Watching on the local network
 
@@ -116,20 +126,26 @@ code like a password for watching TV; to revoke it, disable or delete the
 `viewer` entry under *Configuration → Users → Passwords* and run
 `./atsc.sh urls` again for a new one.
 
-Streams are the broadcast MPEG-2 video and AC-3 audio, untouched (`profile=pass`):
-about 2-4 Mbps for an SD subchannel and 7-12 Mbps for HD, so wired Ethernet or
-decent Wi-Fi is enough. The playlist only lists channels on the RF channel
-currently tuned.
+Streams are the broadcast MPEG-2 video and AC-3 audio, untouched
+(`profile=pass`): about 2-4 Mbps for an SD subchannel and 7-12 Mbps for HD,
+so wired Ethernet or decent Wi-Fi is enough.
+
+**After a rescan, reload the playlist in your player:** channels that appeared
+or disappeared only show up in a freshly loaded playlist. The
+`stream/channelnumber/<n>` URLs stay valid as long as that channel exists.
 
 ### VLC (desktop, Android, iOS)
 
 - **Whole channel list:** *Media → Open Network Stream* (Ctrl+N), paste the
-  playlist URL, Play. Open the playlist view (Ctrl+L) to switch channels.
+  playlist URL, Play. Open the playlist view (Ctrl+L) and double-click a
+  channel to switch; a channel on another RF channel takes a second or two.
 - **Single channel:** paste the `stream/channelnumber/<n>` URL instead.
 - Command line: `vlc "http://192.168.1.5:9981/playlist/auth/channels.m3u?auth=<code>"`
 - Mobile: *More → New stream* (Android) or *Network → Open Network Stream* (iOS).
 - 1080i channels: enable *Video → Deinterlace → On* (or *Yadif (2x)*) to
   remove combing on motion.
+- VLC moves on to the next playlist entry when a stream ends; stop playback
+  when you're done so the tuner is free for scans and other viewers.
 
 ### Stremio
 
@@ -166,95 +182,104 @@ Tvheadend user with streaming rights (including *HTSP*) under
 
 Anything that accepts an M3U tuner and an XMLTV guide works with the two URLs
 above, e.g. Jellyfin: *Dashboard → Live TV → Tuner devices → M3U Tuner*
-(playlist URL) and *TV guide data providers → XMLTV* (guide URL).
+(playlist URL) and *TV guide data providers → XMLTV* (guide URL). Tell the
+app it has **one tuner**.
 
-## Choosing the TV channel
+## Channels and reception
 
-The receiver's settings live in `atsc/config/` (bind-mounted into the
-containers as `/config`, not tracked by git):
-
-| File | What |
-|---|---|
-| `atsc-rx.conf` | `RF_CHANNEL=26` and `GAIN=11`, written by `./atsc.sh tune` |
-| `channels.json` | results of the last scan |
-| `volk/volk_config` | SIMD profile for this CPU (generated by `bootstrap.sh`) |
-
-### Scan
+Which channels exist is decided by a **scan**: every RF channel that locks
+cleanly becomes available in Tvheadend, everything else is hidden. Rescan
+whenever reception changes: a new or moved antenna, a station changing
+frequency, or after the FCC repacks channels.
 
 ```sh
-./atsc.sh scan            # all RF channels 2-36, about 2 minutes
-./atsc.sh scan 22 24 26   # just these; updates those entries in channels.json
-./atsc.sh scan --quick    # spectrum only, no station names
-./atsc.sh list            # show the last scan again
+./atsc.sh scan            # all RF channels 2-36 (about 2 minutes), then sync
+./atsc.sh scan 10 24      # just these; updates those entries, then sync
+./atsc.sh list            # show the last scan
+./atsc.sh sync            # re-apply the last scan to Tvheadend
+./atsc.sh sync 20         # ...also accepting channels with up to 20% errors
 ```
 
-The scan needs the Airspy to itself, so it pauses the receiver (TV stops for
-the duration) and resumes it afterwards. Example:
+The scan needs the Airspy to itself, so it pauses the tuner (anyone watching
+is interrupted) and resumes it afterwards. Example:
 
 ```
  RF  MHz  ripple  errors  stations
- 22  521   4.4dB    1.0%  22.1 ION, 22.2 Bounce, 22.3 Laff, ...
- 24  533  22.4dB  100.0%  no lock (multipath?)
- 26  545   4.1dB    0.2%  8.1 KGW, 8.2 Quest, 8.3 Crime, 49.2 Mystery, 49.4 CourtTV
- 33  587       -       -  signal without 8VSB pilot (ATSC 3.0?)
+ 10  195   6.8dB  100.0%  no lock
+ 24  533   3.2dB    5.2%  2.1 KATU, 2.2 KUNP, 2.3 Comet, 32.1 KRCW
+ 25  539   4.7dB   88.3%  6.1 KOIN-HD, 6.2 GREAT, 6.3 Rewind, 32.2 Antenna, ...
+ 26  545   4.7dB    0.1%  8.1 KGW, 8.2 Quest, 8.3 Crime, 49.2 Mystery, 49.4 CourtTV
+ 30  569       -       -  signal without 8VSB pilot (ATSC 3.0?)
 ```
 
-- **RF / MHz:** the physical channel. This is what you tune, not the virtual
-  number (RF 32 carries virtual 24.x, for example).
+- **RF / MHz:** the physical channel. Virtual numbers can differ (RF 24
+  carries 2.x and 32.1 above).
 - **ripple:** how uneven the signal is across the 6 MHz channel. Under ~8 dB
-  is clean; over ~10 dB means multipath and the station probably won't lock.
-  Re-aim or move the antenna and re-scan that channel to compare.
-- **errors:** packet error rate while decoding for a few seconds. 0-1% is
-  watchable; 100% means no lock.
-- **stations:** virtual channels read from the broadcast itself.
+  is clean; over ~10 dB means multipath (reflections). Low ripple with no lock
+  usually means the signal is simply too weak.
+- **errors:** packet error rate while decoding for a few seconds. Under ~1%
+  is clean, a few percent shows occasional glitches, above ~10% is unwatchable
+  and isn't enabled by `sync`.
+- **stations:** the station's own channel list (PSIP).
 
-### Tune
+What **sync** does in Tvheadend (also run automatically after a scan):
 
-```sh
-./atsc.sh tune 22        # switch to RF 22 (keeps the current gain)
-./atsc.sh tune 22 9      # ...with Airspy gain 9
-./atsc.sh best           # strongest clean channel from the last scan
-./atsc.sh status         # configured channel, containers, stream rate
-```
+- One mux per RF channel that locked, pointing at the tuner; muxes of RF
+  channels that no longer lock are disabled (not deleted) and their channels
+  hidden, so they come back unchanged when reception improves.
+- Channels are created by the network's *bouquet* with auto-map, numbered as
+  broadcast (8.1, 8.2, ...). Only services the station announces are used, so
+  hidden placeholder services don't become channels.
+- A newly enabled RF channel needs Tvheadend to look at it once to discover
+  its services. If the tuner is busy (someone watching), that happens as soon
+  as it's free, and the channels then appear by themselves.
 
-`tune` writes `atsc/config/atsc-rx.conf`, restarts `atsc-rx`, adds the RF
-channel to Tvheadend the first time (as mux `RF <n>` on UDP port 5500 + n,
-mapping its services to channels), and **enables only that RF channel's
-channels**, disabling the rest so players never list channels that can't play.
-Switching back later just re-enables them.
+**Improving reception:** move or re-aim the antenna, then rescan just the
+channels you care about (`./atsc.sh scan 10 25`) and compare ripple and
+errors. VHF channels (RF 2-13) need an antenna with VHF elements; many indoor
+antennas are UHF-only.
 
-### Configuration reference
+## Configuration
 
-`atsc-rx` resolves each setting from, in order: command-line flag, environment
-variable, `atsc/config/atsc-rx.conf`.
+`atsc/config/` holds the receiver's state (bind-mounted into the containers
+as `/config`, not tracked by git):
+
+| File | What |
+|---|---|
+| `atsc-rx.conf` | receiver settings (below) |
+| `channels.json` | results of the last scan |
+| `volk/volk_config` | SIMD profile for this CPU (generated by `bootstrap.sh`) |
+
+`atsc-rx.conf` settings; an environment variable of the same name overrides
+each one:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `RF_CHANNEL` | (none) | RF channel 2-36. With none set, the receiver waits and logs a hint. |
-| `GAIN` | 11 | Airspy linearity gain 0-21 (same scale as `airspy_rx -g`). |
-| `UDP_PORT` | 5500 + RF | Where the stream goes; must match the Tvheadend mux URL. |
-| `STATS` | 60 | Seconds between `TS xx.xx Mbps` log lines. |
+| `GAIN` | 11 | Airspy linearity gain 0-21 (same scale as `airspy_rx -g`). 11 is clean for strong local stations; higher helps weak ones until the front end overloads (around 13+ here). It doesn't fix multipath. |
+| `LISTEN` | `127.0.0.1:5600` | Tuner address. The Tvheadend muxes point here (`tvh_sync.py`). |
+| `IDLE_STOP` | 10 | Seconds without viewers before decoding stops. |
+| `LOCK_TIMEOUT` | 10 | Seconds without transport stream before a viewer is disconnected (no lock). |
 
-Environment variables are handy for one-offs without touching the config:
+Changes take effect after `docker compose restart atsc-rx`.
+
+For debugging, the receiver can also decode one RF channel straight to a file
+(the tuner must be stopped, since it owns the Airspy):
 
 ```sh
 docker compose stop atsc-rx
-docker compose run --rm -e RF_CHANNEL=22 atsc-rx --out /config/rf22.ts   # record raw TS
+docker compose run --rm atsc-rx --channel 24 --out /config/rf24.ts   # Ctrl+C to stop
 docker compose start atsc-rx
 ```
-
-**Gain:** 11 is clean for strong local stations. Higher gain helps weak
-stations until the Airspy's front end overloads (around 13+ here, with many
-strong stations nearby); lowering it doesn't fix multipath.
 
 ## Operations
 
 ```sh
+./atsc.sh status                         # tuner state, containers, recent tuner log
 systemctl --user status tvheadend        # the whole stack (both containers)
 systemctl --user restart tvheadend
-docker logs -f atsc-rx                   # "TS 19.39 Mbps" = locked, 0 = no signal
+docker logs -f atsc-rx                   # tunes, retunes, viewers, lock problems
 docker logs -f tvheadend
-./atsc.sh status
+curl -s http://127.0.0.1:5600/status     # {"rf": 26, "clients": 1, "mbps": 19.39, "locked": true, ...}
 ```
 
 **Update** (after `git pull`, or to pick up a newer Tvheadend image):
@@ -272,19 +297,21 @@ sudo ./host-setup.sh --uninstall   # remove the udev rule
 ```
 
 `uninstall` keeps `config/`, `recordings/` and `atsc/config/` (channels,
-accounts, guide, recordings, your tuned channel) unless `--purge` is given.
-Group memberships, linger and the GRUB change are deliberately left in place.
+accounts, guide, recordings, scan results, settings) unless `--purge` is
+given. Group memberships, linger and the GRUB change are deliberately left in
+place.
 
 ## Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| `atsc-rx` logs `TS 0.00 Mbps` | No lock: `./atsc.sh scan <rf>` and look at ripple/errors; antenna; try another RF channel. |
-| `atsc-rx` logs a run of `O` characters | Sample overflows: the CPU couldn't keep up (other load on the host). Short bursts are absorbed by a 0.5 s buffer. |
-| `atsc-rx` exits with a USB/device error | Airspy unplugged or in use: `docker compose ps`, nothing else running `airspy_rx`; it restarts automatically. |
+| A channel doesn't start, or stops after a few seconds | Its RF channel no longer locks: `./atsc.sh status`, `docker logs atsc-rx` ("no transport stream ... no lock"), then `./atsc.sh scan <rf>`. |
+| A channel is missing from the playlist | Its RF channel didn't lock in the last scan (`./atsc.sh list`), or the playlist in the player is stale (reload it). |
+| "No free tuner" / channel refused | Someone is watching a channel on a different RF channel. One Airspy, one RF channel at a time. |
+| Channels of a newly enabled RF channel never appear | Tvheadend is waiting for a free tuner to scan it; stop all players for ~20 s. |
 | Player gets HTTP 401 | Wrong or revoked `auth` code (`./atsc.sh urls`), or the player isn't on a private LAN address. |
-| Playlist is empty | No channels enabled: `./atsc.sh tune <rf>` re-registers and enables them. |
-| Channels listed but won't play | Receiver is on a different RF channel than the one Tvheadend expects; `./atsc.sh status`, then `./atsc.sh tune`. |
+| `atsc-rx` logs a run of `O` characters | Sample overflows: the CPU couldn't keep up (other load on the host). Short bursts are absorbed by a 0.5 s buffer. |
+| `atsc-rx` exits with a USB/device error | Airspy unplugged or in use by something else (`airspy_rx`, a scan); it restarts automatically. |
 | Picture combing on motion | 1080i content; enable deinterlacing in the player. |
 
 ## Repository layout
@@ -292,17 +319,18 @@ Group memberships, linger and the GRUB change are deliberately left in place.
 | Path | What |
 |---|---|
 | `docker-compose.yml` | `atsc-rx`, `atsc-scan` (tools profile), `tvheadend`; host networking |
-| `atsc.sh` | scan / list / tune / best / status / urls |
+| `atsc.sh` | scan / sync / list / status / urls |
 | `bootstrap.sh` | install / update / uninstall for the current user |
 | `host-setup.sh` | one-time root setup (udev, groups, linger, GRUB) |
 | `systemd/tvheadend.service` | user unit template (bootstrap fills in the path) |
 | `udev/60-airspy.rules` | Airspy device permissions (group `plugdev`) |
 | `atsc/Dockerfile` | receiver image (Debian slim + GNU Radio libraries, no GUI deps) |
-| `atsc/atsc_rx.py` | the receiver |
+| `atsc/atsc_rx.py` | the receiver: on-demand tuner (`--serve`) and one-shot decoding |
 | `atsc/atsc_scan.py` | the scanner |
-| `atsc/tvh_add_mux.py` | registers an RF channel in Tvheadend; `--exclusive` enables only it |
+| `atsc/tvh_sync.py` | makes Tvheadend match the last scan |
 | `atsc/tvh_viewer.py` | creates the `viewer` account, prints player URLs |
-| `atsc/config/` | receiver config, scan results, VOLK profile (git-ignored) |
+| `atsc/tvh_api.py` | small Tvheadend API client used by the two above |
+| `atsc/config/` | receiver settings, scan results, VOLK profile (git-ignored) |
 | `config/`, `recordings/` | Tvheadend state and DVR output (git-ignored) |
 
 No passwords are stored in tracked files: the admin and viewer credentials are
@@ -322,5 +350,12 @@ because the stock chain only reaches 0.79x real time on the i5-7300U:
 
 Result: about **1.15x real time** using roughly 3 of 4 hardware threads, with
 a 0.5 s buffer after the Airspy source so short CPU stalls don't drop samples.
-Offline testing: `atsc_rx.py --iq capture.iq --out out.ts` decodes an
-`airspy_rx -t 2` (int16 IQ, 10 MSPS) recording.
+
+The tuner wraps this in a small threaded HTTP server: the flowgraph writes the
+transport stream into a pipe (`file_descriptor_sink`), and a reader thread fans
+it out to every client of the current RF channel. A request for another RF
+channel stops the flowgraph and builds a new one at the new frequency (a clean
+restart, so no packets from the old channel leak into the new stream).
+
+Offline decoding of a recording: `atsc_rx.py --iq capture.iq --out out.ts`
+(int16 IQ at 10 MSPS, as written by `airspy_rx -t 2`).

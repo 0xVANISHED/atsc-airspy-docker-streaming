@@ -11,7 +11,7 @@ stream URL.
   tvh_viewer.py --host 192.168.1.5
 """
 import argparse, secrets
-from tvh_add_mux import api_client, credentials
+from tvh_api import api_client
 
 USER = "viewer"
 LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
@@ -22,7 +22,7 @@ def main():
     ap.add_argument("--host", required=True, help="LAN address clients use to reach this machine")
     ap.add_argument("--url", default="http://127.0.0.1:9981")
     a = ap.parse_args()
-    api = api_client(a.url, *credentials())
+    api = api_client(a.url)
 
     if not any(e.get("username") == USER for e in api("access/entry/grid", limit=500)["entries"]):
         api("access/entry/create", conf={

@@ -23,6 +23,11 @@ install() {
 
     echo "== directories"
     mkdir -p config recordings atsc/config/volk
+    [[ -f atsc/config/atsc-rx.conf ]] || printf '%s\n' \
+        "# Receiver settings. Environment variables of the same name override." \
+        "# Airspy linearity gain 0-21 (airspy_rx -g scale). 11 is clean for strong locals." \
+        "GAIN=11" \
+        "# Optional: LISTEN=127.0.0.1:5600  IDLE_STOP=10  LOCK_TIMEOUT=10" > atsc/config/atsc-rx.conf
 
     if [[ ! -f config/superuser ]]; then
         echo "== seeding Tvheadend superuser"
@@ -64,19 +69,12 @@ install() {
     done
     [[ -n $ok ]] || { echo "Tvheadend did not come up; see: journalctl --user -u $UNIT" >&2; exit 1; }
 
-    local rf
-    rf=$(sed -n 's/^RF_CHANNEL=//p' atsc/config/atsc-rx.conf 2>/dev/null | tail -1)
-    if [[ -n $rf ]]; then
-        echo "== registering RF $rf (atsc/config/atsc-rx.conf) in Tvheadend"
-        python3 atsc/tvh_add_mux.py --channel "$rf" --port $((5500 + rf)) --exclusive
+    echo "== channels"
+    if [[ -f atsc/config/channels.json ]]; then
+        ./atsc.sh sync
     else
-        echo "== no channel configured: scanning, then tuning the strongest station"
+        echo "   no scan yet: scanning every RF channel (about 2 minutes)"
         ./atsc.sh scan
-        if rf=$(./atsc.sh best); then
-            ./atsc.sh tune "$rf"
-        else
-            echo "   nothing receivable found; check the antenna, then ./atsc.sh scan / ./atsc.sh tune <rf>"
-        fi
     fi
 
     echo "== player URLs (creates the streaming-only 'viewer' account once)"
