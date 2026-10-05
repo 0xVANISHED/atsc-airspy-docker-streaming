@@ -10,8 +10,9 @@ Pass 2 (identify): decode a few seconds of each channel with a pilot to read
 the PSIP virtual channel table (8.1 KGW, ...) and measure packet errors.
 
 Writes JSON (default /config/channels.json; a scan of selected channels updates
-just those entries) and prints a table. Needs the Airspy to itself, so stop
-atsc-rx first (./atsc.sh scan does that).
+just those entries) and prints a table. The tuner (atsc_rx.py --serve) runs
+scans itself via run_scan(); standalone use needs the tuner stopped, since the
+Airspy can only be opened once.
 
   atsc_scan.py              all channels 2-36
   atsc_scan.py 22 26        just these
@@ -176,6 +177,50 @@ def print_table(chans):
         print(f"{c['rf']:3d} {c['freq_mhz']:4d} {(f"{c['ripple_db']:.1f}dB" if 'ripple_db' in c else '-'):>7} {err:>7}  {names}")
 
 
+def run_scan(chans=None, gain=11, out="/config/channels.json", quick=False, dwell=4.0,
+             progress=lambda **kw: None, log=print):
+    """Scan, write results to `out` (a partial scan replaces just its channels),
+    return the result dict. progress(phase=, rf=, done=, total=) reports where
+    we are. The caller must make sure nothing else is using the Airspy."""
+    partial = bool(chans)
+    chans = list(chans or range(2, 37))
+
+    log(f"spectrum pass: {len(chans)} channels, gain {gain}")
+    found = []
+    for i, ch in enumerate(chans):
+        progress(phase="spectrum", rf=ch, done=i, total=len(chans))
+        r = spectrum(ch, gain)
+        if r and r["kind"]:
+            found.append({"rf": ch, "freq_mhz": center_mhz(ch), **r})
+            log(f"  RF {ch:2d}: {'8VSB pilot' if r['kind'] == 'atsc1' else 'signal, no pilot'}"
+                f", ripple {r['ripple_db']} dB")
+
+    atsc1 = [c for c in found if c["kind"] == "atsc1"]
+    if not quick and atsc1:
+        log(f"identify pass: decoding {len(atsc1)} channels for {dwell:g}s each")
+        for i, c in enumerate(atsc1):
+            progress(phase="identify", rf=c["rf"], done=i, total=len(atsc1))
+            errors, tvct = identify(c["rf"], gain, dwell)
+            c["errors_pct"] = round(100 * errors, 1)
+            if tvct:
+                c["tsid"], c["services"] = tvct
+
+    if out:
+        if partial and os.path.exists(out):
+            with open(out) as f:
+                prev = json.load(f).get("channels", [])
+            found = sorted([c for c in prev if c["rf"] not in chans] + found, key=lambda c: c["rf"])
+    result = {"scanned": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+              "gain": gain, "channels": found}
+    if out:
+        tmp = out + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(result, f, indent=2)
+        os.replace(tmp, out)
+        log(f"wrote {out}")
+    return result
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("channels", nargs="*", type=int, help="RF channels (default 2-36)")
@@ -185,42 +230,9 @@ def main():
     ap.add_argument("--quick", action="store_true", help="spectrum pass only, no station names")
     ap.add_argument("--dwell", type=float, default=4.0, help="seconds decoded per channel (default 4)")
     a = ap.parse_args()
-    chans = a.channels or list(range(2, 37))
-
-    print(f"spectrum pass: {len(chans)} channels, gain {a.gain}", flush=True)
-    found = []
-    for ch in chans:
-        r = spectrum(ch, a.gain)
-        if r and r["kind"]:
-            found.append({"rf": ch, "freq_mhz": center_mhz(ch), **r})
-            print(f"  RF {ch:2d}: {'8VSB pilot' if r['kind'] == 'atsc1' else 'signal, no pilot'}"
-                  f", ripple {r['ripple_db']} dB", flush=True)
-
-    atsc1 = [c for c in found if c["kind"] == "atsc1"]
-    if not a.quick and atsc1:
-        print(f"identify pass: decoding {len(atsc1)} channels for {a.dwell:g}s each", flush=True)
-        for c in atsc1:
-            errors, tvct = identify(c["rf"], a.gain, a.dwell)
-            c["errors_pct"] = round(100 * errors, 1)
-            if tvct:
-                c["tsid"], c["services"] = tvct
-
+    result = run_scan(a.channels, a.gain, a.out, a.quick, a.dwell, log=lambda m: print(m, flush=True))
     print()
-    print_table(found)
-
-    if a.out:
-        if a.channels and os.path.exists(a.out):
-            # partial scan: replace just the scanned channels in the previous results
-            with open(a.out) as f:
-                prev = json.load(f).get("channels", [])
-            found = sorted([c for c in prev if c["rf"] not in chans] + found, key=lambda c: c["rf"])
-        result = {"scanned": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                  "gain": a.gain, "channels": found}
-        tmp = a.out + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(result, f, indent=2)
-        os.replace(tmp, a.out)
-        print(f"\nwrote {a.out}")
+    print_table(result["channels"])
 
 
 if __name__ == "__main__":

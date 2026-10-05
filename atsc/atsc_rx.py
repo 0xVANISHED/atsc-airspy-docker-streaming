@@ -7,7 +7,10 @@ transport stream (~19.4 Mbps, all subchannels). One RF channel at a time: a
 request for another channel retunes (newest wins) and the decoder stops when
 nobody has been watching for IDLE_STOP seconds. Tvheadend has one IPTV mux per
 RF channel pointing here, so picking a channel in any player tunes the radio.
-GET /status returns JSON (current channel, clients, rate).
+GET /status returns JSON (current channel, clients, rate, live errors, scan
+progress); POST /scan[?rf=22,24&quick=1] runs a channel scan in the background
+(streams are refused meanwhile). A scan also runs whenever the container is
+created (stack start), but not when Docker restarts it after a crash.
 
 Tuned for a 2-core laptop CPU. Differences from stock gr-dtv atsc_rx:
   * RRC matched filter + resample via a 32/27 rational polyphase resampler
@@ -17,7 +20,7 @@ Tuned for a 2-core laptop CPU. Differences from stock gr-dtv atsc_rx:
   * One-pole IIR DC removal instead of dc_blocker_ff(4096).
 
 Settings: CLI flags, then environment variables, then /config/atsc-rx.conf
-(GAIN=11, LISTEN=127.0.0.1:5600, IDLE_STOP=10).
+(GAIN=11, LISTEN=127.0.0.1:5600, IDLE_STOP=10, LOCK_TIMEOUT=10, SCAN_ON_START=1).
 
   atsc_rx.py --serve                           # on-demand tuner (the container default)
   atsc_rx.py --channel 26 --out rf26.ts        # decode one channel to a file / udp://host:port / -
@@ -58,7 +61,7 @@ def channel_center_hz(ch):
 class atsc_receiver(gr.top_block):
     """out: udp://host:port, a file path, '-' (stdout), or a GNU Radio sink block."""
 
-    def __init__(self, freq, gain, out, pilot_avg=2048, buffer_ms=500, iq_file=None,
+    def __init__(self, freq, gain, out, pilot_avg=2048, buffer_ms=2000, iq_file=None,
                  pilot_scale=PILOT_SCALE):
         gr.top_block.__init__(self, "atsc_rx")
         out_rate = SAMP_RATE * INTERP / DECIM
@@ -78,8 +81,8 @@ class atsc_receiver(gr.top_block):
             src.set_gain(0, "MIX", LIN_MIX[idx])
             src.set_gain(0, "VGA", LIN_VGA[idx])
             # SoapyAirspy's own ring is fixed at ~52 ms and is dropped whole on
-            # overflow, which forces the ATSC decoder to re-lock. A large output
-            # buffer here keeps that ring drained through short CPU stalls.
+            # overflow, which can derail the ATSC decoder. A large output buffer
+            # here (2 s by default) keeps that ring drained through CPU stalls.
             src.set_min_output_buffer(int(SAMP_RATE * buffer_ms / 1000))
 
         # RRC matched filter + resample. Prototype gain scaled so each polyphase
@@ -147,6 +150,9 @@ class atsc_receiver(gr.top_block):
 
 # ---- on-demand tuner -------------------------------------------------------
 
+HIGH_BIT = bytes(range(128, 256))
+
+
 class Client:
     def __init__(self):
         self.q = queue.Queue(maxsize=256)  # up to 16 MB at 64 KB/item; a stalled client gets dropped
@@ -154,17 +160,37 @@ class Client:
 
 
 class Tuner:
-    """One Airspy, one RF channel at a time, decoding only while someone watches."""
+    """One Airspy, one RF channel at a time, decoding only while someone watches.
+    Also runs channel scans, since it owns the Airspy; streams are refused meanwhile."""
 
-    def __init__(self, gain, idle_stop):
-        self.gain, self.idle_stop = gain, idle_stop
+    def __init__(self, gain, idle_stop, scan_out):
+        self.gain, self.idle_stop, self.scan_out = gain, idle_stop, scan_out
+        self.scan = {"running": False, "phase": None, "rf": None, "done": 0, "total": 0,
+                     "started": None, "finished": None, "error": None, "count": 0}
         self.mutex = threading.Lock()
         self.tb = self.rf = self.idle_timer = None
         self.clients = ()            # replaced, never mutated: feed() reads it without the lock
         self.tuned_at = self.last_data = 0.0
+        self.ts_offset, self.err_window = 0, []   # live packet error stats: [second, packets, errors]
+        self.bad_since = self.last_restart = 0.0
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
     def feed(self, data):
-        self.last_data = time.monotonic()
+        now = self.last_data = time.monotonic()
+        # Live reception: count TS packets flagged with transport_error_indicator.
+        # The stream is packet-aligned from its first byte, so track the offset.
+        first = (-self.ts_offset) % 188
+        flags = data[first + 1::188]
+        errs = len(flags) - len(flags.translate(None, HIGH_BIT))   # bytes with the TEI bit set
+        self.ts_offset += len(data)
+        sec = int(now)
+        if self.err_window and self.err_window[-1][0] == sec:
+            self.err_window[-1][1] += len(flags)
+            self.err_window[-1][2] += errs
+        else:
+            self.err_window.append([sec, len(flags), errs])
+            while self.err_window and self.err_window[0][0] < sec - 5:
+                self.err_window.pop(0)
         for c in self.clients:
             if c.dead:
                 continue
@@ -187,6 +213,8 @@ class Tuner:
 
     def subscribe(self, rf):
         with self.mutex:
+            if self.scan["running"]:
+                raise RuntimeError("scanning")
             if self.idle_timer:
                 self.idle_timer.cancel()
                 self.idle_timer = None
@@ -226,10 +254,18 @@ class Tuner:
         self.tb = atsc_receiver(channel_center_hz(rf), self.gain,
                                 blocks.file_descriptor_sink(gr.sizeof_char, w))
         self.rf, self.tuned_at, self.last_data = rf, time.monotonic(), 0.0
+        self.ts_offset, self.err_window = 0, []
         self.pump_stop = threading.Event()
         threading.Thread(target=self._pump, args=(r, self.pump_stop), daemon=True).start()
         self.tb.start()
         log(f"tuned RF {rf} ({channel_center_hz(rf)/1e6:.0f} MHz, gain {self.gain})")
+
+    def _stop_pipeline(self):
+        tb, self.tb = self.tb, None
+        tb.stop()
+        tb.wait()
+        self.pump_stop.set()
+        del tb                       # destroys the sink, closing the pipe's write end
 
     def _stop(self, why):
         if not self.tb:
@@ -241,29 +277,93 @@ class Tuner:
             except queue.Full:
                 pass
         self.clients = ()
-        tb, self.tb = self.tb, None
-        tb.stop()
-        tb.wait()
-        self.pump_stop.set()
-        del tb                       # destroys the sink, closing the pipe's write end
+        self._stop_pipeline()
         if why:
             log(f"stopped RF {self.rf} ({why})")
         self.rf = None
 
+    def _errors(self, seconds=5):
+        """Packet error % over the last complete `seconds`, or None without data."""
+        window = [w for w in list(self.err_window)[:-1] if w[0] >= int(time.monotonic()) - seconds]
+        pkts, errs = sum(w[1] for w in window), sum(w[2] for w in window)
+        return round(100 * errs / pkts, 1) if pkts else None
+
+    def _watchdog(self):
+        """Dropped samples (CPU starvation) can leave gr-dtv's equalizer diverged:
+        still synced, every packet uncorrectable, and it never recovers. If errors
+        stay >= 80% for 2 s, rebuild the decoder on the same channel; viewers stay
+        connected and see a few seconds' glitch."""
+        while True:
+            time.sleep(1)
+            with self.mutex:
+                now = time.monotonic()
+                if not self.tb or not self.clients or now - self.tuned_at < 5:
+                    self.bad_since = 0.0
+                    continue
+                err = self._errors(2)
+                if err is None or err < 80:
+                    self.bad_since = 0.0
+                    continue
+                self.bad_since = self.bad_since or now
+                if now - self.bad_since < 2 or now - self.last_restart < 10:
+                    continue
+                rf = self.rf
+                log(f"RF {rf}: {err}% packet errors for {now - self.bad_since:.0f}s; restarting the decoder")
+                self._stop_pipeline()
+                self._start(rf)
+                self.bad_since, self.last_restart = 0.0, time.monotonic()
+
     def status(self):
         tb = self.tb
+        locked = bool(tb and self.last_data and time.monotonic() - self.last_data < 2)
+        err = self._errors()
         return {"rf": self.rf, "clients": len(self.clients),
                 "mbps": round(tb.rate_probe.rate() * 8 / 1e6, 2) if tb else 0.0,
-                "locked": bool(tb and self.last_data and time.monotonic() - self.last_data < 2),
-                "tuned_for_s": round(time.monotonic() - self.tuned_at) if tb else 0}
+                "locked": locked,
+                # packet errors over the last ~5 s of decoding (None until there's data)
+                "errors_pct": err if locked else None,
+                "tuned_for_s": round(time.monotonic() - self.tuned_at) if tb else 0,
+                "scan": dict(self.scan)}
+
+    def start_scan(self, chans=None, quick=False, why="requested"):
+        """Scan in the background (stops any stream first). False if one is running."""
+        with self.mutex:
+            if self.scan["running"]:
+                return False
+            if self.idle_timer:
+                self.idle_timer.cancel()
+                self.idle_timer = None
+            self._stop("scan")
+            self.scan.update(running=True, phase="starting", rf=None, done=0, total=0,
+                             started=time.time(), error=None)
+        log(f"scan started ({why}){' for RF ' + ','.join(map(str, chans)) if chans else ''}")
+        threading.Thread(target=self._run_scan, args=(chans, quick), daemon=True).start()
+        return True
+
+    def _run_scan(self, chans, quick):
+        import atsc_scan
+        try:
+            res = atsc_scan.run_scan(chans, self.gain, self.scan_out, quick,
+                                     progress=lambda **kw: self.scan.update(**kw),
+                                     log=lambda m: log(f"scan: {m.strip()}"))
+            ok = [c["rf"] for c in res["channels"] if c["kind"] == "atsc1" and c.get("services")
+                  and c.get("errors_pct", 100) <= 10]
+            log(f"scan finished: clean reception on RF {', '.join(map(str, ok)) or 'none'}")
+        except Exception as e:
+            self.scan["error"] = str(e)
+            log(f"scan failed: {e}")
+        finally:
+            with self.mutex:
+                self.scan.update(running=False, phase=None, rf=None, finished=time.time(),
+                                 count=self.scan["count"] + 1)
 
     def close(self):
         with self.mutex:
             self._stop("shutdown")
 
 
-def serve(listen, gain, idle_stop, lock_timeout):
-    tuner = Tuner(gain, idle_stop)
+def serve(listen, gain, idle_stop, lock_timeout, scan_out, scan_on_start):
+    tuner = Tuner(gain, idle_stop, scan_out)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"   # stream until either side closes
@@ -286,7 +386,11 @@ def serve(listen, gain, idle_stop, lock_timeout):
                 self.send_error(404, "use /rf/<2-36> or /status")
                 return
             rf = int(m.group(1))
-            c = tuner.subscribe(rf)
+            try:
+                c = tuner.subscribe(rf)
+            except RuntimeError:
+                self.send_error(503, "scanning for channels; try again in a couple of minutes")
+                return
             self.send_response(200)
             self.send_header("Content-Type", "video/mp2t")
             self.send_header("Cache-Control", "no-cache")
@@ -306,6 +410,21 @@ def serve(listen, gain, idle_stop, lock_timeout):
             finally:
                 tuner.unsubscribe(c)
 
+        def do_POST(self):
+            path, _, query = self.path.partition("?")
+            if path.rstrip("/") != "/scan":
+                self.send_error(404)
+                return
+            q = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
+            chans = [int(x) for x in q.get("rf", "").split(",") if x.strip().isdigit()] or None
+            started = tuner.start_scan(chans, q.get("quick") in ("1", "true"), "requested over HTTP")
+            body = json.dumps({"started": started, "scan": tuner.scan}).encode()
+            self.send_response(202 if started else 409)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     host, port = listen.rsplit(":", 1)
     httpd = ThreadingHTTPServer((host, int(port)), Handler)
     httpd.daemon_threads = True
@@ -316,6 +435,13 @@ def serve(listen, gain, idle_stop, lock_timeout):
     signal.signal(signal.SIGTERM, shutdown)
 
     log(f"on-demand tuner on http://{listen}/rf/<n> (gain {gain}, idle stop {idle_stop}s)")
+    # Fresh scan whenever the container is (re)created, i.e. the stack was
+    # started; not when Docker merely restarts it after a crash, since /tmp
+    # (and this marker) survive a restart of the same container.
+    marker = "/tmp/atsc-rx.scanned"
+    if scan_on_start and not os.path.exists(marker):
+        open(marker, "w").close()
+        tuner.start_scan(why="container start")
     httpd.serve_forever()
     tuner.close()
 
@@ -355,15 +481,17 @@ def main():
     ap.add_argument("--iq", help="decode an int16 IQ recording (airspy_rx -t 2, 10 MSPS) instead of the Airspy")
     ap.add_argument("--out", default="-", help="udp://host:port, a file path, or - for stdout (default)")
     ap.add_argument("--gain", type=int, help="Airspy linearity gain 0-21 [GAIN, default 11]")
-    ap.add_argument("--buffer-ms", type=int, default=500,
-                    help="sample buffer after the Airspy source, absorbs CPU stalls (default 500)")
+    ap.add_argument("--buffer-ms", type=int, default=2000,
+                    help="sample buffer after the Airspy source, absorbs CPU stalls (default 2000)")
     a = ap.parse_args()
     conf = load_config(a.config)
     gain = int(setting("GAIN", a.gain, conf, 11))
 
     if a.serve is not None:
         serve(a.serve or setting("LISTEN", None, conf, "127.0.0.1:5600"), gain,
-              float(setting("IDLE_STOP", None, conf, 10)), float(setting("LOCK_TIMEOUT", None, conf, 10)))
+              float(setting("IDLE_STOP", None, conf, 10)), float(setting("LOCK_TIMEOUT", None, conf, 10)),
+              os.path.join(os.path.dirname(a.config), "channels.json"),
+              str(setting("SCAN_ON_START", None, conf, "1")).lower() not in ("0", "no", "false"))
         return
 
     channel = setting("RF_CHANNEL", a.channel, conf)

@@ -8,10 +8,12 @@ has persistent authentication enabled, so players use a URL containing
 ?auth=<code> instead of logging in: the playlist embeds that code in every
 stream URL.
 
+The code is also saved to atsc/config/viewer.json for the web TV container.
+
   tvh_viewer.py --host 192.168.1.5
 """
-import argparse, secrets
-from tvh_api import api_client
+import argparse, json, os, secrets
+from tvh_api import HERE, api_client
 
 USER = "viewer"
 LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
@@ -44,13 +46,22 @@ def main():
         code = next(e for e in api("passwd/entry/grid", limit=500)["entries"]
                     if e.get("username") == USER).get("authcode")
 
+    path = os.path.join(HERE, "config", "viewer.json")
+    old = os.umask(0o077)
+    try:
+        with open(path, "w") as f:
+            json.dump({"user": USER, "auth": code}, f)
+    finally:
+        os.umask(old)
+
     base = f"http://{a.host}:9981"
     print(f"""
 Playlist (M3U, all enabled channels):  {base}/playlist/auth/channels.m3u?auth={code}
 Guide (XMLTV):                         {base}/xmltv/channels?auth={code}
 One channel, e.g. 8.1:                 {base}/stream/channelnumber/8.1?auth={code}
 Web UI (admin):                        {base}/
-Kodi / HTSP clients:                   {a.host}, port 9982 (use a Tvheadend user with HTSP rights)""")
+Kodi / HTSP clients:                   {a.host}, port 9982 (use a Tvheadend user with HTSP rights)
+Web TV (browser):                      http://{a.host}/""")
 
 
 if __name__ == "__main__":

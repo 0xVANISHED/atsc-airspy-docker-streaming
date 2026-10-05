@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Make Tvheadend match the last channel scan (atsc/config/channels.json).
 
-  * One IPTV mux per RF channel, pointing at the on-demand tuner
-    (http://127.0.0.1:5600/rf/<n>). Muxes of RF channels that locked in the scan
+  * One IPTV mux per RF channel, reading the on-demand tuner
+    (http://127.0.0.1:5600/rf/<n>) through atsc/tvh_pipe.py with respawn.
+    Muxes of RF channels that locked in the scan
     (packet errors <= --max-errors, station names decoded) are enabled; the
     rest are disabled, not deleted, so they come back as they were.
   * The network allows one input stream (there is one Airspy): picking a
@@ -21,13 +22,16 @@
 import argparse, json, os, re, sys, time
 from tvh_api import NETWORK_NAME, HERE, api_client
 
-TUNER = "http://127.0.0.1:5600/rf/{rf}"
+# Tvheadend runs atsc/tvh_pipe.py (the repo's atsc/ is mounted at /atsc) per mux;
+# it reconnects across tuner restarts (plain http:// never reconnects).
+TUNER = "pipe:///usr/bin/python3 /atsc/tvh_pipe.py {rf}"
 
 
 def mux_rf(m):
     """RF channel of one of our muxes, from its name or URL."""
     for text in (m.get("name") or "", m.get("iptv_url") or ""):
-        g = re.search(r"RF (\d+)$", text) or re.search(r"/rf/(\d+)$", text) or re.search(r":55(\d\d)$", text)
+        g = (re.search(r"RF (\d+)$", text) or re.search(r"/rf/(\d+)$", text)
+             or re.search(r"(?:atsc-pipe|tvh_pipe\.py) (\d+)$", text) or re.search(r":55(\d\d)$", text))
         if g:
             return int(g.group(1))
     return None
@@ -78,7 +82,7 @@ def main():
         if rf in good and rf not in have:
             have[rf] = m
             want = {"iptv_url": TUNER.format(rf=rf), "iptv_muxname": f"RF {rf}",
-                    "iptv_atsc": True, "enabled": 1}
+                    "iptv_atsc": True, "iptv_respawn": True, "enabled": 1}
             if any(m.get(k) != v for k, v in want.items()):
                 api("idnode/save", node={"uuid": m["uuid"], **want})
         elif m.get("enabled") != 0:
@@ -86,7 +90,7 @@ def main():
     for rf in sorted(set(good) - set(have)):
         api("mpegts/network/mux_create", uuid=net_uuid, conf={
             "enabled": 1, "iptv_muxname": f"RF {rf}", "iptv_url": TUNER.format(rf=rf),
-            "iptv_atsc": True, "epg": 1})
+            "iptv_atsc": True, "iptv_respawn": True, "epg": 1})
         print(f"created mux RF {rf}")
     mux_of = {m["uuid"]: mux_rf(m) for m in our_muxes()}
 

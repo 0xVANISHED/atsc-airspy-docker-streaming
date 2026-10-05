@@ -11,6 +11,7 @@ UNIT=tvheadend.service
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 TVH_IMAGE=ghcr.io/tvheadend/tvheadend:master-debian
 RX_IMAGE=atsc-rx:local
+WEB_IMAGE=webtv:local
 VOLK_KERNELS="32fc_32f_dot_prod_32fc|32fc_s32fc_x2_rotator|32fc_x2_multiply_conjugate_32fc|32fc_deinterleave_real_32f|32f_x2_add_32f|32f_x2_subtract_32f|32fc_x2_add_32fc|32f_s32f_multiply_32f|32fc_x2_multiply_32fc|32f_x2_dot_prod_32f|16i_s32f_convert_32f|32fc_magnitude_32f"
 
 need_docker() {
@@ -40,7 +41,7 @@ install() {
 
     echo "== images"
     docker compose pull tvheadend
-    docker compose build atsc-rx
+    docker compose build atsc-rx webtv
 
     if [[ ! -s atsc/config/volk/volk_config ]]; then
         echo "== profiling VOLK SIMD kernels for this CPU (about a minute)"
@@ -69,16 +70,11 @@ install() {
     done
     [[ -n $ok ]] || { echo "Tvheadend did not come up; see: journalctl --user -u $UNIT" >&2; exit 1; }
 
-    echo "== channels"
-    if [[ -f atsc/config/channels.json ]]; then
-        ./atsc.sh sync
-    else
-        echo "   no scan yet: scanning every RF channel (about 2 minutes)"
-        ./atsc.sh scan
-    fi
-
     echo "== player URLs (creates the streaming-only 'viewer' account once)"
     ./atsc.sh urls
+
+    echo "== channel scan (runs on every stack start; about 2 minutes)"
+    ./atsc.sh follow
 }
 
 uninstall() {
@@ -93,13 +89,13 @@ uninstall() {
     echo "== containers and images"
     if docker info >/dev/null 2>&1; then
         docker compose down --remove-orphans || true
-        docker image rm "$RX_IMAGE" "$TVH_IMAGE" 2>/dev/null || true
+        docker image rm "$RX_IMAGE" "$WEB_IMAGE" "$TVH_IMAGE" 2>/dev/null || true
     else
         echo "   docker not reachable; skipped"
     fi
 
     echo "== generated files"
-    rm -rf atsc/config/volk atsc/__pycache__
+    rm -rf atsc/config/volk atsc/__pycache__ web/__pycache__
 
     if [[ $purge == --purge ]]; then
         echo "== purging config/, recordings/ and atsc/config/"

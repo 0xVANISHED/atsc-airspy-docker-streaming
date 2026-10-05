@@ -1,9 +1,11 @@
 # Over-the-air ATSC TV from an Airspy R2, served by Tvheadend.
 #
 #   atsc-rx    on-demand tuner: GET http://127.0.0.1:5600/rf/<n> tunes the Airspy and
-#              streams that RF channel's MPEG-TS (GNU Radio gr-dtv); idle when unwatched
-#   atsc-scan  one-off channel scan (tools profile; ./atsc.sh scan runs it)
-#   tvheadend  ingests that UDP stream as an IPTV mux and serves it to clients
+#              streams that RF channel's MPEG-TS (GNU Radio gr-dtv); idle when unwatched.
+#              Also scans for channels: on every stack start, and on request.
+#   tvheadend  one IPTV mux per RF channel on the tuner; serves channels, playlist, guide
+#   webtv      browser page (port 80): player, channels, reception, rescan button.
+#              Updates Tvheadend after every scan.
 #
 # Tvheadend can't drive an SDR itself, so the Airspy is only passed to atsc-rx.
 # State lives next to this file (all git-ignored):
@@ -11,37 +13,35 @@
 #   ./config      -> /var/lib/tvheadend             (settings, channels, EPG)
 #   ./recordings  -> /var/lib/tvheadend/recordings  (DVR)
 #
-# Web UI: http://<host>:9981   HTSP (Kodi etc.): 9982
+# Tvheadend web UI: http://<host>:9981   HTSP (Kodi etc.): 9982   Web TV: http://<host>/
 #
-# All containers run as UID/GID 1000 (the first user on Debian/Ubuntu) so files
-# they write stay owned by that user, and take the host's timezone from
-# /etc/localtime.
-
-# Shared by atsc-rx and atsc-scan: same image, Airspy access and config dir.
-x-airspy: &airspy
-  build: ./atsc
-  image: atsc-rx:local
-  # Host networking: Tvheadend reaches the tuner on 127.0.0.1:5600.
-  network_mode: host
-  user: "1000:1000"
-  group_add:
-    - plugdev   # owns the Airspy's /dev/bus/usb node (udev/60-airspy.rules); GID 46 on host and image
-  # Bind-mount the USB bus (instead of a fixed device node) and allow USB char
-  # devices, so an unplug/replug of the Airspy is picked up on restart.
-  device_cgroup_rules:
-    - "c 189:* rmw"
-  volumes:
-    - /dev/bus/usb:/dev/bus/usb
-    - /etc/localtime:/etc/localtime:ro
-    - ./atsc/config:/config
+# Containers run as UID/GID 1000 (the first user on Debian/Ubuntu) so files they
+# write stay owned by that user, and take the host's timezone from /etc/localtime.
 
 services:
   atsc-rx:
-    <<: *airspy
+    build: ./atsc
+    image: atsc-rx:local
     container_name: atsc-rx
     restart: unless-stopped
-    # Tvheadend picks the RF channel per request; GAIN / LISTEN / IDLE_STOP come
-    # from ./atsc/config/atsc-rx.conf, environment variables override.
+    # Host networking: Tvheadend and webtv reach the tuner on 127.0.0.1:5600.
+    network_mode: host
+    user: "1000:1000"
+    group_add:
+      - plugdev   # owns the Airspy's /dev/bus/usb node (udev/60-airspy.rules); GID 46 on host and image
+    # Bind-mount the USB bus (instead of a fixed device node) and allow USB char
+    # devices, so an unplug/replug of the Airspy is picked up on restart.
+    device_cgroup_rules:
+      - "c 189:* rmw"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - /etc/localtime:/etc/localtime:ro
+      - ./atsc/config:/config
+    # Real-time decoding must win CPU contention (default weight is 1024):
+    # starved, the Airspy drops samples and the picture breaks up.
+    cpu_shares: 4096
+    # GAIN / LISTEN / IDLE_STOP / SCAN_ON_START come from ./atsc/config/atsc-rx.conf;
+    # environment variables override.
     command: ["--serve"]
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5600/status', timeout=5)"]
@@ -49,21 +49,19 @@ services:
       timeout: 10s
       retries: 3
 
-  atsc-scan:
-    <<: *airspy
-    profiles: [tools]
-    entrypoint: ["python3", "/app/atsc_scan.py"]
-
   tvheadend:
     image: ghcr.io/tvheadend/tvheadend:master-debian
     container_name: tvheadend
     restart: unless-stopped
-    # Host networking: receives the decoder's UDP stream on localhost and
-    # serves clients on the LAN without port mapping.
+    # Host networking: reaches the tuner on localhost and serves clients on the
+    # LAN without port mapping.
     network_mode: host
     user: "1000:1000"
     volumes:
       - /etc/localtime:/etc/localtime:ro
+      # mux helper (atsc/tvh_pipe.py): pipe:// to the tuner. The directory, not the
+      # file, so edits show up (a single-file mount pins the old copy).
+      - ./atsc:/atsc:ro
       - ./config:/var/lib/tvheadend:rw
       - ./recordings:/var/lib/tvheadend/recordings:rw
     command: --config /var/lib/tvheadend --nosatip
@@ -76,15 +74,29 @@ services:
       nofile:
         soft: 8192
         hard: 65535
-    # Hardware transcoding (later): needs an image with intel-media-va-driver
-    # added (upstream image only ships mesa VA drivers, which don't cover Intel).
-    # devices:
-    #   - /dev/dri:/dev/dri
-    # group_add:
-    #   - "<video gid>"
-    #   - "<render gid>"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if b'PONG' in urllib.request.urlopen('http://127.0.0.1:9981/ping', timeout=5).read() else 1)"]
       interval: 60s
       timeout: 10s
       retries: 3
+
+  webtv:
+    build: ./web
+    image: webtv:local
+    container_name: webtv
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PORT: "80"             # the web page's port; change to serve elsewhere
+      HEIGHT: "720"          # browser stream resolution cap (1080 costs more GPU and bandwidth)
+      BITRATE: "3M"
+    # Runs as root in the container: it binds port 80 and opens the GPU without
+    # host-specific group IDs. Without /dev/dri it falls back to software
+    # transcoding (drop the devices entry on hosts without a GPU).
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      # scripts (tvh_sync.py) + config/ (viewer.json auth code, channels.json scan)
+      - ./atsc:/atsc:ro
+      # Tvheadend admin login, for tvh_sync.py after each scan
+      - ./config/superuser:/config/superuser:ro
