@@ -27,6 +27,7 @@ is reproducible from this repo with two scripts.
 - [Configuration](#configuration)
 - [Operations](#operations): status, logs, updates, uninstall
 - [Troubleshooting](#troubleshooting)
+- [Remote access (away from home)](#remote-access-away-from-home): VLC and Apple TV over the internet
 - [Repository layout](#repository-layout)
 - [Receiver internals](#receiver-internals)
 
@@ -314,6 +315,162 @@ in place.
 | Player gets HTTP 401 | Wrong or revoked `auth` code (`./atsc.sh urls`), or the player isn't on a private LAN address. |
 | iPhone page won't play | Expected: turn "Play in this page" off and tap a channel to open it in VLC. |
 | Picture combing on motion (apps) | 1080i content; enable deinterlacing in the player. The web page deinterlaces for you. |
+
+## Remote access (away from home)
+
+Optional, and off until you set it up: players outside the LAN (VLC on a
+laptop or phone elsewhere, an Apple TV at a friend's) can watch through two
+router port forwards and short links served by the `shortlink` container.
+Everything about remote access is in this section.
+
+### How it works
+
+`shortlink` (a service in `docker-compose.yml`, code in `atsc/shortlink.py`)
+listens on port 9980 and answers two kinds of short link:
+
+- `/<code>` **redirects to Tvheadend's playlist**,
+  `http://<public IP>:9981/playlist/auth/channels.m3u?auth=<auth code>`.
+- `/<code>/8.1` **relays one channel** from Tvheadend and adds the channel's
+  name in an `Icy-Name` header. VLC shows that as the title ("22.1 ION"); a
+  redirect would leave it showing just "22.1" from the URL. Relaying is a
+  plain socket copy, well under 1% CPU.
+
+Anything else on 9980 gets a 404. `<code>` is derived from the `viewer`
+account's auth code, so it isn't stored anywhere or in git, and it only
+changes when that auth code is revoked. `./atsc.sh urls` prints it on its last
+line, `Short link (away from home)`.
+
+Only the two forwarded ports are reachable from the internet: 9981
+(Tvheadend: playlist, streams, and its admin login, which is protected by the
+random `admin` password from install) and 9980 (`shortlink`). The web page
+(port 80, no login) and HTSP (9982) stay LAN-only; never forward port 80 to
+the web page.
+
+### Setup
+
+1. **Give this machine a fixed LAN address** in the router (DHCP
+   reservation), so the forwards keep pointing at it.
+2. **Add two port forwards** (TCP) to that address:
+
+   | Router (external) | To this machine | For |
+   |---|---|---|
+   | 9981 | 9981 | Tvheadend: the playlist link and its channels |
+   | 9980 | 9980 | `shortlink`: all short links |
+
+   One-channel short links only need 9980; the playlist link redirects to
+   9981. Keep the external ports the same as the internal ones, and don't use
+   external port 80 (many routers, UniFi included, answer on it themselves).
+   On UniFi gateways the rules are under *Settings → Routing → Port
+   Forwarding*, or *Settings → Policy Engine → Port Forwarding* in Network
+   9.4 and later.
+3. **Let the `viewer` account in from anywhere.** It only accepts private LAN
+   addresses by default. In Tvheadend (`http://<host>:9981`), *Configuration
+   → Users → Access Entries → viewer*, set **Allowed networks** to
+   `0.0.0.0/0,::/0` and save. Without this, outside players get HTTP 401.
+4. **Check from the outside:**
+
+   ```sh
+   curl -s https://ifconfig.co/port/9981   # "reachable": true
+   curl -s https://ifconfig.co/port/9980
+   ```
+
+   If they stay unreachable with the forwards in place, compare the router's
+   WAN address with your public IP (`curl -s https://ifconfig.co`). A WAN
+   address in 100.64.0.0/10 means carrier-grade NAT: the ISP doesn't let
+   incoming connections through, and port forwarding can't work.
+
+### Links
+
+| Link | Opens | For |
+|---|---|---|
+| `http://<public IP>:9980/<code>` | the playlist (every channel) | VLC on computers and phones |
+| `http://<public IP>:9980/<code>/8.1` | one channel, by number, with its name | VLC on Apple TV; any player |
+
+- The channel numbers are in the web page and in `./atsc.sh list`.
+- The long URLs work too, from outside: the playlist URL and the
+  `stream/channelnumber/<n>` URL from `./atsc.sh urls`, with this machine's
+  LAN address replaced by your public IP. A long one-channel URL plays
+  without the channel's name.
+- A dynamic-DNS name works in place of the IP; the playlist redirect keeps
+  whatever address the player used.
+- The links work from home too, through the router's NAT loopback (UniFi does
+  this), which is a quick way to test them.
+
+### Watching
+
+- **VLC on a computer or phone:** open the playlist link (*Media → Open
+  Network Stream*, Ctrl+N; *More → New stream* on Android, *Network* on
+  iOS). The playlist view (Ctrl+L) switches channels.
+- **VLC on Apple TV:** use **one-channel links**. VLC there loads the
+  playlist but doesn't play its entries. Enter a link in the *Network Stream*
+  tab. Typing is easier on an iPhone (tap the "Apple TV Keyboard"
+  notification) or in a browser: VLC's *Remote Playback* tab shows an address
+  to open on a phone or computer on the same Wi-Fi, where links can be
+  pasted. Every link opened stays in the *Network Stream* list, so opening
+  one per channel once leaves a channel menu; the player shows the channel's
+  number and name.
+
+### Limits
+
+- **Anyone with a link can watch.** The links are plain HTTP, so the code is
+  readable on the network path too. Share them only with people you trust,
+  and revoke them if they spread (below).
+- **Upload bandwidth:** each remote viewer gets the untouched broadcast,
+  2-4 Mbps for SD and 7-12 Mbps for HD, from your home upload. Transcoding to
+  something smaller would starve the receiver on this CPU.
+- **One tuner:** a remote viewer holds the Airspy on their RF channel. Until
+  they stop, nobody (at home or away) can watch a channel on a different RF
+  channel.
+- **Channels come and go with scans** (every stack start rescans): a link
+  for a channel that's missing from the last scan fails until it's back.
+- **Public IP changes** break the links. Use dynamic DNS (built into most
+  routers, UniFi included) and hand out the name instead of the IP.
+
+### Who's watching
+
+```sh
+docker logs -f shortlink                       # client IP -> playlist / channel (and when it stopped), or "miss"
+docker logs tvheadend 2>&1 | grep subscription # streams started and stopped: channel, client IP, player
+```
+
+Tvheadend sees relayed one-channel viewers as this host; the `shortlink` log
+has their real address. Devices at home that use the public address show up
+as the router's LAN address (NAT loopback). A client that keeps fetching the
+playlist but never starts a stream is a player that can't use the playlist
+(VLC on Apple TV): send it one-channel links.
+
+### Revoking and closing
+
+- **New links** (one was shared too widely): in Tvheadend, *Configuration →
+  Users → Passwords*, delete the `viewer` entry, then run `./atsc.sh urls`.
+  It creates a new auth code and prints the new short code. Every remote
+  player needs the new links. Players at home that use the web page are
+  unaffected.
+- **Close it:** remove both port forwards and set the `viewer` entry's
+  Allowed networks back to `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8`.
+  `shortlink` can keep running; without the forwards it's only reachable on
+  the LAN.
+
+### Settings
+
+Environment variables of the `shortlink` service in `docker-compose.yml`;
+apply with `docker compose up -d shortlink`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SHORT_PORT` | 9980 | Port the short links are served on. |
+| `TVH_PUBLIC_PORT` | 9981 | External port the router forwards to Tvheadend; the playlist redirect points there. |
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Outside player can't connect | The forwards: one-channel links need 9980, the playlist link also 9981. `curl -s https://ifconfig.co/port/9980` (and `9981`) from this machine. |
+| HTTP 401 | The `viewer` entry's *Allowed networks* isn't open (Setup, step 3), or the auth code was revoked. |
+| Short link gives 404 | Only `/<code>` and `/<code>/<channel number>` exist; check the code with `./atsc.sh urls`. `docker logs shortlink` shows each miss. |
+| One-channel link gives 400 | That channel isn't in the last scan (`./atsc.sh list`): its RF channel didn't lock. |
+| VLC on Apple TV loads, nothing plays | It can't play playlist entries; use one-channel links. |
+| Player shows only the number ("22.1") | It's using a long `:9981` URL; the short one-channel link carries the name. |
 
 ## Repository layout
 

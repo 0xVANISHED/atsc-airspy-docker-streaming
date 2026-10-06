@@ -6,6 +6,7 @@
 #   tvheadend  one IPTV mux per RF channel on the tuner; serves channels, playlist, guide
 #   webtv      browser page (port 80): player, channels, reception, rescan button.
 #              Updates Tvheadend after every scan.
+#   shortlink  short links (port 9980) for players outside the LAN: playlist, single channels
 #
 # Tvheadend can't drive an SDR itself, so the Airspy is only passed to atsc-rx.
 # State lives next to this file (all git-ignored):
@@ -14,6 +15,7 @@
 #   ./recordings  -> /var/lib/tvheadend/recordings  (DVR)
 #
 # Tvheadend web UI: http://<host>:9981   HTSP (Kodi etc.): 9982   Web TV: http://<host>/
+# Short link: http://<host>:9980/<code>
 #
 # Containers run as UID/GID 1000 (the first user on Debian/Ubuntu) so files they
 # write stay owned by that user, and take the host's timezone from /etc/localtime.
@@ -100,3 +102,20 @@ services:
       - ./atsc:/atsc:ro
       # Tvheadend admin login, for tvh_sync.py after each scan
       - ./config/superuser:/config/superuser:ro
+
+  shortlink:
+    # Short links for players away from home (atsc/shortlink.py; './atsc.sh urls'
+    # prints the code): http://<public IP>:9980/<code> redirects to the playlist,
+    # .../<code>/8.1 relays one channel with its name. Reachable from the internet
+    # only through a router port forward (external 9980 -> this :9980).
+    image: webtv:local     # just needs python3
+    container_name: shortlink
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    environment:
+      SHORT_PORT: "9980"
+      TVH_PUBLIC_PORT: "9981"   # the router's forward to Tvheadend
+    entrypoint: ["python3", "/atsc/shortlink.py"]
+    volumes:
+      - ./atsc:/atsc:ro

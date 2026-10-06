@@ -7,7 +7,7 @@
 #   ./atsc.sh sync [max-errors%]        make Tvheadend match the last scan (default 10)
 #   ./atsc.sh list                      show the last scan (atsc/config/channels.json)
 #   ./atsc.sh status                    what the tuner is doing, container health
-#   ./atsc.sh urls                      playlist / guide / stream URLs for players on the LAN
+#   ./atsc.sh urls                      playlist / guide / stream URLs for players, short link
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 CONF=atsc/config/atsc-rx.conf
@@ -116,6 +116,7 @@ EOF
 
 urls() {
     python3 atsc/tvh_viewer.py --host "$(hostname -I | awk '{print $1}')"
+    echo "Short link (away from home):           http://<public IP>:9980/$(python3 atsc/shortlink.py --code)"
 }
 
 case ${1:-} in
